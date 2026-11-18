@@ -17,4 +17,4 @@ The GRAND and ORBGRAND implementations and several comparison-code constructions
 
 https://github.com/kenrduffy/GRAND-MATLAB
 
-The exact GRAND-MATLAB version used for the final simulations will be identified together with the final archived R-OCB implementation.
+The R-OCB implementation and simulation code corresponding to the results reported in the final paper are archived in this repository. The exact matrix file used for the retained CA-Polar (n=128), (k=116) baseline is identified in the final paper.
