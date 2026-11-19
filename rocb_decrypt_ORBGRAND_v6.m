@@ -1,8 +1,6 @@
-function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_ORBGRAND_v6(key_hex, N, C_in, T_in, taglen, n, k, max_query, P)
+function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ... 
+    rocb_decrypt_ORBGRAND_v6(key_hex, N, C_in, T_in, taglen, n, k, max_query, P)
 %ROCB_DECRYPT_ORBGRAND_V6  Joint ROCB decryption-decoding using ORBGRAND.
-%
-%   [c_decoded,M_out,valid,abandoned,n_guesses,info] = ...
-%       rocb_decrypt_ORBGRAND_v6(key_hex,N,C_in,T_in,taglen,n,k,max_query,P)
 %
 % This implementation follows the ROCB decryption pseudocode.  It is the
 % ORBGRAND/AWGN counterpart of rocb_decrypt_GRAND_v6: the ROCB inverse
@@ -118,6 +116,9 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
     info.ell_len = ell_len;
     info.num_blocks = num_blocks;
 
+    % Default case: the final encoded block is the only data block.
+    I_last = [0, k-ell_len];
+
     % ================================================================
     % 1) Decode blocks 1,...,num_blocks-2 as full/regular blocks with P.
     % ================================================================
@@ -126,7 +127,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
             C_block_soft = get_block(C_in, i, n);
 
             [decoded, D_bits, C_hat, noise_found, guesses] = ...
-                rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), {P}, 'full', k, max_query);
+                rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), P, {P}, 'full', [], k, max_query);
 
             n_guesses(i) = guesses;
             c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -153,7 +154,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
         C_block_soft = get_block(C_in, i, n);
 
         [decoded, B, C_hat, noise_found, guesses] = ...
-            rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), {P, P_tilde}, 'full', k, max_query);
+            rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), P, {P, P_tilde}, 'split', [], k, max_query);
 
         n_guesses(i) = guesses;
         c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -169,30 +170,32 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
 
         P_pen = B(end-(n-k)+1:end);
         if isequal(P_pen, P)
-            % B = M || P
+            % Regular full block: B = M || P.
             M_out = [M_out, B(1:k)]; %#ok<AGROW>
             info.penultimate_type = 'full_P';
+            % Final block follows a regular full block.
+            I_last = [0, k-ell_len-1];
         elseif isequal(P_pen, P_tilde)
+            % First encoded block of a split last fragment.
+            % ORBGRAND has already verified that the length field is zero.
             % B = M_part || P_rand || n_P_rand || P_tilde.
             len_bits = B(k-ell_len+1:k);
             n_rand = bits_to_uint(len_bits);
-            if n_rand > k-ell_len
-                abandoned(i) = 1;
-                info.decode_failure_reason = 'Invalid random-padding length in penultimate block.';
-                valid = false;
-                M_out = [];
-                return;
-            end
-            msg_len = k - ell_len - n_rand;
-            M_out = [M_out, B(1:msg_len)]; %#ok<AGROW>
+
+            M_out = [M_out, B(1:k-ell_len)]; %#ok<AGROW>
+
             info.penultimate_type = 'split_first_P_tilde';
             info.penultimate_n_rand = n_rand;
+
+            % Final block follows a split-prefix block.
+            I_last = [k-2*ell_len, k-ell_len-1];
         else
-            abandoned(i) = 1;
-            info.decode_failure_reason = 'Penultimate block padding is neither P nor P_tilde.';
-            valid = false;
-            M_out = [];
-            return;
+            % abandoned(i) = 1;
+            % info.decode_failure_reason = 'Penultimate block padding is neither P nor P_tilde.';
+            % valid = false;
+            % M_out = [];
+            % return;
+            error('Internal error: unexpected penultimate block format.');
         end
 
         Checksum = bitxor(Checksum, bits_to_bytes(B));
@@ -206,7 +209,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
     C_block_soft = get_block(C_in, i, n);
 
     [decoded, B_last, C_hat, noise_found, guesses] = ...
-        rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), {P_tilde}, 'last', k, max_query);
+        rocb_orbgrand_block(key_hex, C_block_soft, L, Z(i,:), P, {P_tilde}, 'last', I_last, k, max_query);
 
     n_guesses(i) = guesses;
     c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -222,14 +225,8 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
 
     len_bits = B_last(k-ell_len+1:k);
     n_rand_last = bits_to_uint(len_bits);
-    if n_rand_last > k-ell_len
-        abandoned(i) = 1;
-        info.decode_failure_reason = 'Invalid random-padding length in final block.';
-        valid = false;
-        M_out = [];
-        return;
-    end
 
+    % The admissible interval has already been checked inside ORBGRAND.
     msg_len_last = k - ell_len - n_rand_last;
     M_last = B_last(1:msg_len_last);
     M_out = [M_out, M_last];
@@ -246,8 +243,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_OR
     P_tag = Checksum_bits(end-(n-k)+1:end);
 
     [tag_decoded, T_hat, tag_C_hat, tag_noise_found, tag_guesses] = ...
-        rocb_orbgrand_block(key_hex, T_in, L, Z(num_blocks,:), {P_tag}, 'tag', k, max_query);
-
+        rocb_orbgrand_block(key_hex, T_in, L, Z(num_blocks,:), P, {P_tag}, 'tag', [], k, max_query);
     info.tag_n_guesses = tag_guesses;
     info.tag_noise_found = tag_noise_found;
     info.tag_hat = T_hat;
@@ -277,7 +273,7 @@ end
 % ROCB.ORBGRAND helper
 % =====================================================================
 function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
-    rocb_orbgrand_block(key_hex, C_block_soft, L, Z, P_acc, type, k, max_query)
+    rocb_orbgrand_block(key_hex, C_block_soft, L, Z, P, P_acc, type, I_last, k, max_query)
 %ROCB_ORBGRAND_BLOCK  ORBGRAND membership test for one ROCB block.
 %
 % type = 'full': D = InvCipher(C_hat xor Z) xor Z
@@ -304,7 +300,7 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
 
     % ---------------- first query: zero-noise candidate ----------------
     [decoded, D_or_T_hat, C_hat, noise_found] = try_candidate( ...
-        key_hex, C_ref, zeros(1,n,'uint8'), L, L_inv, Z, P_acc, type, k);
+        key_hex, C_ref, zeros(1,n,'uint8'), L, L_inv, Z, P, P_acc, type, I_last, k);
     n_guesses = 1;
     if decoded == 1 || n_guesses >= max_query
         return;
@@ -334,7 +330,7 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
                 err_vec(reliability_order(ordered_locations)) = 1;
 
                 [decoded, D_or_T_hat, C_hat, noise_found] = try_candidate( ...
-                    key_hex, C_ref, err_vec, L, L_inv, Z, P_acc, type, k);
+                    key_hex, C_ref, err_vec, L, L_inv, Z, P, P_acc, type, I_last, k);
                 n_guesses = n_guesses + 1;
 
                 if decoded == 1
@@ -348,9 +344,10 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
 end
 
 function [decoded, D_or_T_hat, C_hat, noise_found] = try_candidate( ...
-    key_hex, C_ref, err_vec, L, L_inv, Z, P_acc, type, k)
+    key_hex, C_ref, err_vec, L, L_inv, Z, P, P_acc, type, I_last, k)
 
     n = length(C_ref);
+    ell_len = ceil(log2(n));
     decoded = 0;
     D_or_T_hat = [];
     C_hat = int8(mod(double(C_ref) + double(err_vec), 2));
@@ -360,7 +357,7 @@ function [decoded, D_or_T_hat, C_hat, noise_found] = try_candidate( ...
         C_hat_bytes = bits_to_bytes(uint8(C_hat));
 
         switch type
-            case 'full'
+            case {'full', 'split'}
                 tmp = bitxor(C_hat_bytes, Z);
                 D_bytes = aes_dec_bytes(key_hex, tmp);
                 D_bytes = bitxor(D_bytes, Z);
@@ -386,11 +383,51 @@ function [decoded, D_or_T_hat, C_hat, noise_found] = try_candidate( ...
     pad_len = length(P_acc{1});
     P_test = D_bits(end-pad_len+1:end);
 
+    candidate_valid = false;
+
     if padding_is_acceptable(P_test, P_acc)
+
+        switch type
+
+            case {'full', 'tag'}
+                % Padding membership is sufficient.
+                candidate_valid = true;
+
+            case 'split'
+                if isequal(uint8(P_test), uint8(P))
+                    % Regular full block.
+                    candidate_valid = true;
+
+                else
+                    % Since P_test is acceptable and is not P,
+                    % it is P_tilde. A split-prefix block must
+                    % encode n_rand = 0.
+                    len_bits = D_bits(k-ell_len+1:k);
+                    n_rand_test = bits_to_uint(len_bits);
+
+                    candidate_valid = (n_rand_test == 0);
+                end
+
+            case 'last'
+                % Final-block validity depends on the decoding context.
+                len_bits = D_bits(k-ell_len+1:k);
+                n_rand_test = bits_to_uint(len_bits);
+
+                candidate_valid = ...
+                    ~isempty(I_last) && ...
+                    n_rand_test >= I_last(1) && ...
+                    n_rand_test <= I_last(2);
+
+            otherwise
+                error('Unknown ROCB ORBGRAND block type: %s.', type);
+        end
+    end
+
+    if candidate_valid
         decoded = 1;
         noise_found = uint8(err_vec);
+
         if strcmp(type, 'tag')
-            % The pseudocode returns the corrected tag block C_hat.
             D_or_T_hat = uint8(C_hat);
         else
             D_or_T_hat = D_bits;

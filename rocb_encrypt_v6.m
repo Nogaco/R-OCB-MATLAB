@@ -36,6 +36,10 @@ function [C_out, T_out, info] = rocb_encrypt_v6(key_hex, N, M, taglen, n, k, P)
     validateattributes(k, {'numeric'}, {'scalar','integer','positive','<',n});
     validateattributes(taglen, {'numeric'}, {'scalar','integer','positive','<=',n});
 
+    if taglen ~= n
+        error('The R-OCB construction studied here requires taglen = n.');
+    end
+
     if mod(n,8) ~= 0
         error('n must be a multiple of 8 because AES/Cipher is byte based.');
     end
@@ -51,8 +55,9 @@ function [C_out, T_out, info] = rocb_encrypt_v6(key_hex, N, M, taglen, n, k, P)
 
     BLOCKLEN = n/8;
     ell_len = ceil(log2(n));        % 7 when n = 128
-    if ell_len > k
-        error('k must be at least ceil(log2(n)).');
+    
+    if 2*ell_len > k
+        error('The construction requires 2*ceil(log2(n)) <= k.');
     end
 
     % ---------------------- initialize L and H ----------------------

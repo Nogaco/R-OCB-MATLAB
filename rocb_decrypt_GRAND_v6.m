@@ -1,8 +1,6 @@
-function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GRAND_v6(key_hex, N, C_in, T_in, taglen, n, k, max_query, P)
+function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ... 
+    rocb_decrypt_GRAND_v6(key_hex, N, C_in, T_in, taglen, n, k, max_query, P)
 %ROCB_DECRYPT_GRAND_V6  Joint ROCB decryption-decoding using GRAND.
-%
-%   [c_decoded,M_out,valid,abandoned,n_guesses,info] = ...
-%       rocb_decrypt_GRAND_v6(key_hex,N,C_in,T_in,taglen,n,k,max_query,P)
 %
 % This implementation follows the ROCB decryption pseudocode:
 %   1. Split the noisy input into ciphertext blocks and tag.
@@ -40,7 +38,6 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
     validateattributes(n, {'numeric'}, {'scalar','integer','positive'});
     validateattributes(k, {'numeric'}, {'scalar','integer','positive','<',n});
     validateattributes(taglen, {'numeric'}, {'scalar','integer','positive','<=',n});
-    % validateattributes(max_query, {'numeric'}, {'scalar','integer','positive'});
 
     if mod(n,8) ~= 0
         error('n must be a multiple of 8 because AES/Cipher is byte based.');
@@ -131,6 +128,9 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
     info.ell_len = ell_len;
     info.num_blocks = num_blocks;
 
+    % Default case: the final encoded block is the only data block.
+    I_last = [0, k-ell_len];
+
     % ================================================================
     % 1) Decode blocks 1,...,num_blocks-2 as regular blocks with P.
     % ================================================================
@@ -138,8 +138,8 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
         for i = 1:num_blocks-2
             C_block = get_block(C_in, i, n);
 
-            [decoded, D_bits, C_hat, noise_found, guesses] = ...
-                rocb_grand_block(key_hex, C_block, L, Z(i,:), {P}, 'reg', k, max_query);
+            [decoded, D_bits, C_hat, ~, guesses] = ...
+                rocb_grand_block(key_hex, C_block, L, Z(i,:), P, {P}, 'full', [], k, max_query);
 
             n_guesses(i) = guesses;
             c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -164,8 +164,8 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
         i = num_blocks - 1;
         C_block = get_block(C_in, i, n);
 
-        [decoded, B, C_hat, noise_found, guesses] = ...
-            rocb_grand_block(key_hex, C_block, L, Z(i,:), {P, P_tilde}, 'reg', k, max_query);
+        [decoded, B, C_hat, ~, guesses] = ...
+            rocb_grand_block(key_hex, C_block, L, Z(i,:), P, {P, P_tilde}, 'split', [], k, max_query);
 
         n_guesses(i) = guesses;
         c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -179,34 +179,34 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
         end
 
         P_pen = B(end-(n-k)+1:end);
+        
         if isequal(P_pen, P)
-            % B = M || P
+            % Regular full block: B = M || P.
             M_out = [M_out, B(1:k)]; %#ok<AGROW>
             info.penultimate_type = 'regular_P';
+            % The final block follows a regular full block.
+            I_last = [0, k-ell_len-1];
         elseif isequal(P_pen, P_tilde)
+            % First encoded block of a split last fragment.
+            % GRAND has already verified that its length field is zero.
             % B = M_part || P_rand || n_P_rand || P_tilde.
             % In the split branch of the encryptor, n_P_rand is 0^ell_len,
             % but this parser follows the general pseudocode instruction:
             % truncate the information part according to n_P_rand.
             len_bits = B(k-ell_len+1:k);
             n_rand = bits_to_uint(len_bits);
-            if n_rand > k-ell_len
-                abandoned(i) = 1;
-                info.decode_failure_reason = 'Invalid random-padding length in penultimate block.';
-                valid = false;
-                M_out = [];
-                return;
-            end
-            msg_len = k - ell_len - n_rand;
-            M_out = [M_out, B(1:msg_len)]; %#ok<AGROW>
+            M_out = [M_out, B(1:k-ell_len)]; %#ok<AGROW>
             info.penultimate_type = 'split_first_P_tilde';
             info.penultimate_n_rand = n_rand;
+            % The final block follows a split-prefix block.
+            I_last = [k-2*ell_len, k-ell_len-1];
         else
-            abandoned(i) = 1;
-            info.decode_failure_reason = 'Penultimate block padding is neither P nor P_tilde.';
-            valid = false;
-            M_out = [];
-            return;
+            % abandoned(i) = 1;
+            % info.decode_failure_reason = 'Penultimate block padding is neither P nor P_tilde.';
+            % valid = false;
+            % M_out = [];
+            % return;
+            error('Internal error: unexpected penultimate block format.');
         end
 
         Checksum = bitxor(Checksum, bits_to_bytes(B));
@@ -219,8 +219,8 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
     i = num_blocks;
     C_block = get_block(C_in, i, n);
 
-    [decoded, B_last, C_hat, noise_found, guesses] = ...
-        rocb_grand_block(key_hex, C_block, L, Z(i,:), {P_tilde}, 'last', k, max_query);
+    [decoded, B_last, C_hat, ~, guesses] = ...
+        rocb_grand_block(key_hex, C_block, L, Z(i,:), P, {P_tilde}, 'last', I_last, k, max_query);
 
     n_guesses(i) = guesses;
     c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -235,17 +235,12 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
 
     len_bits = B_last(k-ell_len+1:k);
     n_rand_last = bits_to_uint(len_bits);
-    if n_rand_last > k-ell_len
-        abandoned(i) = 1;
-        info.decode_failure_reason = 'Invalid random-padding length in final block.';
-        valid = false;
-        M_out = [];
-        return;
-    end
-
+    
+    % The admissible interval has already been checked inside GRAND.
     msg_len_last = k - ell_len - n_rand_last;
     M_last = B_last(1:msg_len_last);
     M_out = [M_out, M_last];
+
     Checksum = bitxor(Checksum, bits_to_bytes(B_last));
 
     info.final_n_rand = n_rand_last;
@@ -259,7 +254,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = rocb_decrypt_GR
     P_tag = Checksum_bits(end-(n-k)+1:end);
 
     [tag_decoded, T_hat, tag_C_hat, tag_noise_found, tag_guesses] = ...
-        rocb_grand_block(key_hex, T_in, L, Z(num_blocks,:), {P_tag}, 'tag', k, max_query);
+        rocb_grand_block(key_hex, T_in, L, Z(num_blocks,:), P, {P_tag}, 'tag', [], k, max_query);
 
     info.tag_n_guesses = tag_guesses;
     info.tag_noise_found = tag_noise_found;
@@ -290,14 +285,16 @@ end
 % ROCB.GRAND helper from the pseudocode
 % =====================================================================
 function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
-    rocb_grand_block(key_hex, C_block, L, Z, P_acc, type, k, max_query)
+    rocb_grand_block(key_hex, C_block, L, Z, P, P_acc, type, I_last, k, max_query)
 %ROCB_GRAND_BLOCK  GRAND membership test for one ROCB block.
 %
-% type = 'reg' : D = InvCipher(C_hat xor Z) xor Z
-% type = 'last': D = InvCipher(C_hat xor Z) xor L*x^{-1} xor Z
-% type = 'tag' : D = InvCipher(C_hat) xor Z; return C_hat on success
+% type = 'full' : regular full data block
+% type = 'split': block immediately preceding the final encoded block
+% type = 'last' : final encoded block
+% type = 'tag'  : authentication tag
 
     n = length(C_block);
+    ell_len = ceil(log2(n));
     decoded = 0;
     D_or_T_hat = [];
     C_hat = -1 * ones(1, n, 'int8');
@@ -316,7 +313,7 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
 
         try
             switch type
-                case 'reg'
+                case {'full', 'split'}
                     tmp = bitxor(C_hat_bytes, Z);
                     D_bytes = aes_dec_bytes(key_hex, tmp);
                     D_bytes = bitxor(D_bytes, Z);
@@ -346,15 +343,55 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses] = ...
         pad_len = length(P_acc{1});
         P_test = D_bits(end-pad_len+1:end);
 
+        candidate_valid = false;
+
         if padding_is_acceptable(P_test, P_acc)
+            switch type
+
+                case {'full', 'tag'}
+                    % Padding membership is sufficient.
+                    candidate_valid = true;
+
+                case 'split'
+                    if isequal(uint8(P_test), uint8(P))
+                        % Regular full block.
+                        candidate_valid = true;
+
+                    elseif isequal(uint8(P_test), uint8(P_acc{2}))
+                        % Split-prefix block.
+                        % Its encoded length field must be exactly zero.
+                        len_bits = D_bits(k-ell_len+1:k);
+                        n_rand_test = bits_to_uint(len_bits);
+
+                        candidate_valid = (n_rand_test == 0);
+                    end
+
+                case 'last'
+                    % Final-block validity depends on the decoding context.
+                    len_bits = D_bits(k-ell_len+1:k);
+                    n_rand_test = bits_to_uint(len_bits);
+
+                    candidate_valid = ...
+                        ~isempty(I_last) && ...
+                        n_rand_test >= I_last(1) && ...
+                        n_rand_test <= I_last(2);
+
+                otherwise
+                    error('Unknown ROCB GRAND block type: %s.', type);
+            end
+        end
+
+        if candidate_valid
             decoded = 1;
             noise_found = err_vec;
+
             if strcmp(type, 'tag')
                 % The pseudocode returns the corrected tag block C_hat.
                 D_or_T_hat = uint8(C_hat);
             else
                 D_or_T_hat = D_bits;
             end
+
             return;
         end
 

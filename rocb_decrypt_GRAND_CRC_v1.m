@@ -19,8 +19,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
 %   n         : block length in bits, e.g., 128.
 %   k         : information length in bits, e.g., 112, 116, 120.
 %   max_query : maximum GRAND guesses per block.
-%   P         : fixed redundancy padding of length n-k bits. Optional;
-%               default is all zeros.
+%   CRC       : struct containing the CRC parity-check matrix CRC.H.
 %
 % Outputs
 %   c_decoded : decoded/corrected ciphertext bits, without the tag.
@@ -122,6 +121,9 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     info.ell_len = ell_len;
     info.num_blocks = num_blocks;
 
+    % Default case: the final encoded block is the only data block.
+    I_last = [0, k-ell_len];
+
     % ================================================================
     % 1) Blocks 1,...,num_blocks-2: regular CRC codewords.
     % ================================================================
@@ -132,7 +134,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
             [decoded, D_bits, C_hat, noise_found, guesses, block_kind] = ...
                 rocb_grand_block_crc( ...
                     key_hex, C_block, L, Z(i,:), ...
-                    'regular', k, ell_len, max_query, H_crc, []);
+                    'regular', k, ell_len, max_query, H_crc, [], []);
 
             n_guesses(i) = guesses;
             c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -162,7 +164,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
             rocb_grand_block_crc( ...
                 key_hex, C_block, L, Z(i,:), ...
                 'regular_or_special', k, ell_len, ...
-                max_query, H_crc, []);
+                max_query, H_crc, [], []);
 
         n_guesses(i) = guesses;
         c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -181,18 +183,23 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
             M_out = [M_out, B(1:k)]; %#ok<AGROW>
             info.penultimate_type = 'regular_crc';
 
+            % Final block follows a regular full block.
+            I_last = [0, k-ell_len-1];
+
         elseif strcmp(block_kind,'special')
             U = B(1:k);
 
             len_bits = U(k-ell_len+1:k);
             n_rand = bits_to_uint(len_bits);
 
-            % This has already been checked by the GRAND membership test.
-            msg_len = k - ell_len - n_rand;
+            % GRAND has already verified that a split-prefix block has n_rand = 0.
+            M_out = [M_out, U(1:k-ell_len)]; %#ok<AGROW>
 
-            M_out = [M_out, U(1:msg_len)]; %#ok<AGROW>
             info.penultimate_type = 'split_first_crc_special';
             info.penultimate_n_rand = n_rand;
+
+            % Final block follows a split-prefix block.
+            I_last = [k-2*ell_len, k-ell_len-1];
 
         else
             error('Internal error: unexpected penultimate block kind.');
@@ -210,7 +217,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     [decoded, B_last, C_hat, noise_found, guesses, block_kind] = ...
         rocb_grand_block_crc( ...
             key_hex, C_block, L, Z(i,:), ...
-            'special', k, ell_len, max_query, H_crc, []);
+            'special', k, ell_len, max_query, H_crc, [], I_last);
 
     n_guesses(i) = guesses;
     c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -251,7 +258,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     [tag_decoded, T_hat, tag_C_hat, tag_noise_found, tag_guesses] = ...
         rocb_grand_block_crc( ...
             key_hex, T_in, L, Z(num_blocks,:), ...
-            'tag', k, ell_len, max_query, H_crc, P_tag);
+            'tag', k, ell_len, max_query, H_crc, P_tag, []);
 
     info.tag_n_guesses = tag_guesses;
     info.tag_noise_found = tag_noise_found;
@@ -287,7 +294,7 @@ end
 function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses, block_kind] = ...
     rocb_grand_block_crc( ...
         key_hex, C_block, L, Z, membership, ...
-        k, ell_len, max_query, H_crc, P_tag)
+        k, ell_len, max_query, H_crc, P_tag, I_last)
 
     n = length(C_block);
 
@@ -346,7 +353,8 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses, block_kind] = ...
             end
 
         elseif strcmp(membership,'special')
-            if crc_special_is_valid(D_bits, H_crc, k, ell_len)
+            if crc_special_is_valid( ...
+            D_bits, H_crc, k, ell_len, 'last', I_last)
                 decoded = 1;
                 block_kind = 'special';
             end
@@ -356,7 +364,8 @@ function [decoded, D_or_T_hat, C_hat, noise_found, n_guesses, block_kind] = ...
                 decoded = 1;
                 block_kind = 'regular';
 
-            elseif crc_special_is_valid(D_bits, H_crc, k, ell_len)
+            elseif crc_special_is_valid( ...
+                    D_bits, H_crc, k, ell_len, 'split', [])
                 decoded = 1;
                 block_kind = 'special';
             end
@@ -401,7 +410,8 @@ function ok = crc_regular_is_valid(D_bits, H_crc)
     ok = all(syndrome == 0);
 end
 
-function ok = crc_special_is_valid(D_bits, H_crc, k, ell_len)
+function ok = crc_special_is_valid( ...
+    D_bits, H_crc, k, ell_len, special_type, I_last)
     % Undo the special coset marker before the CRC syndrome test.
     B_crc = uint8(D_bits(:).');
     marker_pos = k + 1;
@@ -414,12 +424,26 @@ function ok = crc_special_is_valid(D_bits, H_crc, k, ell_len)
         return;
     end
 
-    % Also enforce a structurally valid special-block length field.
+    % Extract the encoded random-padding length.
     U = uint8(D_bits(1:k));
     len_bits = U(k-ell_len+1:k);
     n_rand = bits_to_uint(len_bits);
 
-    ok = (n_rand <= k-ell_len);
+    switch special_type
+
+        case 'split'
+            % First block of a split final fragment.
+            ok = (n_rand == 0);
+
+        case 'last'
+            % Final-block validity depends on decoding context.
+            ok = ~isempty(I_last) && ...
+                n_rand >= I_last(1) && ...
+                n_rand <= I_last(2);
+
+        otherwise
+            error('Unknown CRC special-block type: %s.', special_type);
+    end
 end
 
 % =====================================================================

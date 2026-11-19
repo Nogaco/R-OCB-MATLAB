@@ -78,6 +78,9 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     info.ell_len = ell_len;
     info.num_blocks = num_blocks;
 
+    % Default: the final block is the only data block.
+    I_last = [0, k-ell_len];
+
     % ================================================================
     % 1) Regular blocks
     % ================================================================
@@ -88,7 +91,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
             [decoded,D_bits,C_hat,noise_found,guesses,block_kind] = ...
                 rocb_orbgrand_block_crc( ...
                     key_hex,C_block_soft,L,Z(i,:), ...
-                    'regular',k,ell_len,max_query,H_crc,[]);
+                    'regular',k,ell_len,max_query,H_crc,[],[]);
 
             n_guesses(i) = guesses;
             c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -116,7 +119,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
         [decoded,B,C_hat,noise_found,guesses,block_kind] = ...
             rocb_orbgrand_block_crc( ...
                 key_hex,C_block_soft,L,Z(i,:), ...
-                'regular_or_special',k,ell_len,max_query,H_crc,[]);
+                'regular_or_special',k,ell_len,max_query,H_crc,[],[]);
 
         n_guesses(i) = guesses;
         c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -135,16 +138,26 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
             M_out = [M_out,B(1:k)]; %#ok<AGROW>
             info.penultimate_type = 'regular_crc';
 
+            % Final block follows a regular full block.
+            I_last = [0, k-ell_len-1];
+
         elseif strcmp(block_kind,'special')
             U = B(1:k);
+
             len_bits = U(k-ell_len+1:k);
             n_rand = bits_to_uint(len_bits);
 
-            msg_len = k-ell_len-n_rand;
-            M_out = [M_out,U(1:msg_len)]; %#ok<AGROW>
+            % ORBGRAND has already verified that a split-prefix block has n_rand = 0.
+            M_out = [M_out,U(1:k-ell_len)]; %#ok<AGROW>
 
             info.penultimate_type = 'split_first_crc_special';
             info.penultimate_n_rand = n_rand;
+
+            % Final block follows a split-prefix block.
+            I_last = [k-2*ell_len, k-ell_len-1];
+
+        else
+            error('Internal error: unexpected penultimate block kind.');
         end
 
         Checksum = bitxor(Checksum,bits_to_bytes(B));
@@ -159,7 +172,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     [decoded,B_last,C_hat,noise_found,guesses,block_kind] = ...
         rocb_orbgrand_block_crc( ...
             key_hex,C_block_soft,L,Z(i,:), ...
-            'special',k,ell_len,max_query,H_crc,[]);
+            'special',k,ell_len,max_query,H_crc,[],I_last);
 
     n_guesses(i) = guesses;
     c_decoded((i-1)*n+1:i*n) = int8(C_hat);
@@ -197,7 +210,7 @@ function [c_decoded, M_out, valid, abandoned, n_guesses, info] = ...
     [tag_decoded,T_hat,tag_C_hat,tag_noise_found,tag_guesses] = ...
         rocb_orbgrand_block_crc( ...
             key_hex,T_in,L,Z(num_blocks,:), ...
-            'tag',k,ell_len,max_query,H_crc,P_tag);
+            'tag',k,ell_len,max_query,H_crc,P_tag,[]);
 
     info.tag_n_guesses = tag_guesses;
     info.tag_noise_found = tag_noise_found;
@@ -231,9 +244,9 @@ end
 % ORBGRAND helper
 % =====================================================================
 function [decoded,D_or_T_hat,C_hat,noise_found,n_guesses,block_kind] = ...
-    rocb_orbgrand_block_crc( ...
+        rocb_orbgrand_block_crc( ...
         key_hex,C_block_soft,L,Z,membership, ...
-        k,ell_len,max_query,H_crc,P_tag)
+        k,ell_len,max_query,H_crc,P_tag,I_last)
 
     n = length(C_block_soft);
 
@@ -257,7 +270,7 @@ function [decoded,D_or_T_hat,C_hat,noise_found,n_guesses,block_kind] = ...
     [decoded,D_or_T_hat,C_hat,noise_found,block_kind] = ...
         try_crc_candidate( ...
             key_hex,C_ref,err_vec,L_inv,Z,membership, ...
-            k,ell_len,H_crc,P_tag);
+            k,ell_len,H_crc,P_tag,I_last);
 
     n_guesses = 1;
 
@@ -298,7 +311,7 @@ function [decoded,D_or_T_hat,C_hat,noise_found,n_guesses,block_kind] = ...
                 [decoded,D_or_T_hat,C_hat,noise_found,block_kind] = ...
                     try_crc_candidate( ...
                         key_hex,C_ref,err_vec,L_inv,Z,membership, ...
-                        k,ell_len,H_crc,P_tag);
+                        k,ell_len,H_crc,P_tag,I_last);
 
                 n_guesses = n_guesses+1;
 
@@ -315,7 +328,7 @@ end
 function [decoded,D_or_T_hat,C_hat,noise_found,block_kind] = ...
     try_crc_candidate( ...
         key_hex,C_ref,err_vec,L_inv,Z,membership, ...
-        k,ell_len,H_crc,P_tag)
+        k,ell_len,H_crc,P_tag,I_last)
 
     n = length(C_ref);
 
@@ -356,7 +369,8 @@ function [decoded,D_or_T_hat,C_hat,noise_found,block_kind] = ...
         end
 
     elseif strcmp(membership,'special')
-        if crc_special_is_valid(D_bits,H_crc,k,ell_len)
+        if crc_special_is_valid( ...
+                D_bits,H_crc,k,ell_len,'last',I_last)
             decoded = 1;
             block_kind = 'special';
         end
@@ -365,7 +379,9 @@ function [decoded,D_or_T_hat,C_hat,noise_found,block_kind] = ...
         if crc_regular_is_valid(D_bits,H_crc)
             decoded = 1;
             block_kind = 'regular';
-        elseif crc_special_is_valid(D_bits,H_crc,k,ell_len)
+
+        elseif crc_special_is_valid( ...
+                D_bits,H_crc,k,ell_len,'split',[])
             decoded = 1;
             block_kind = 'special';
         end
@@ -401,23 +417,41 @@ function ok = crc_regular_is_valid(D_bits,H_crc)
     ok = all(syndrome == 0);
 end
 
-function ok = crc_special_is_valid(D_bits,H_crc,k,ell_len)
-    B_crc = uint8(D_bits(:).');
-    marker_pos = k+1;
-    B_crc(marker_pos) = uint8(1-B_crc(marker_pos));
+function ok = crc_special_is_valid( ...
+    D_bits,H_crc,k,ell_len,special_type,I_last)
 
-    syndrome = mod(double(H_crc)*double(B_crc(:)),2);
+% Undo the special coset marker before the CRC syndrome test.
+B_crc = uint8(D_bits(:).');
+marker_pos = k+1;
+B_crc(marker_pos) = uint8(1-B_crc(marker_pos));
 
-    if ~all(syndrome == 0)
-        ok = false;
-        return;
-    end
+syndrome = mod(double(H_crc)*double(B_crc(:)),2);
 
-    U = uint8(D_bits(1:k));
-    len_bits = U(k-ell_len+1:k);
-    n_rand = bits_to_uint(len_bits);
+if ~all(syndrome == 0)
+    ok = false;
+    return;
+end
 
-    ok = (n_rand <= k-ell_len);
+% Extract the encoded random-padding length.
+U = uint8(D_bits(1:k));
+len_bits = U(k-ell_len+1:k);
+n_rand = bits_to_uint(len_bits);
+
+switch special_type
+
+    case 'split'
+        % First block of a split final fragment.
+        ok = (n_rand == 0);
+
+    case 'last'
+        % Final-block validity depends on decoding context.
+        ok = ~isempty(I_last) && ...
+            n_rand >= I_last(1) && ...
+            n_rand <= I_last(2);
+
+    otherwise
+        error('Unknown CRC special-block type: %s.',special_type);
+end
 end
 
 % =====================================================================
